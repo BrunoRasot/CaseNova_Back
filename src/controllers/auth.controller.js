@@ -51,8 +51,7 @@ const isLocked = (user) => {
 };
 
 const getClientIp = (req) => req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'IP_DESCONOCIDA';
-
-const isMissingColumnError = (error) => error?.code === 'ER_BAD_FIELD_ERROR';
+const isMissingColumnError = (error) => error?.code === '42703';
 
 const runSafeQuery = async (query, params = []) => {
   try {
@@ -66,26 +65,25 @@ const runSafeQuery = async (query, params = []) => {
 };
 
 const resetFailedAttempts = async (userId) => {
-  await runSafeQuery('UPDATE usuarios SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?', [userId]);
+  await runSafeQuery('UPDATE usuarios SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1', [userId]);
 };
 
 const registerFailedAttempt = async (userId) => {
-  const result = await runSafeQuery('SELECT failed_login_attempts FROM usuarios WHERE id = ? LIMIT 1', [userId]);
-  if (!result) {
+  const result = await runSafeQuery('SELECT failed_login_attempts FROM usuarios WHERE id = $1 LIMIT 1', [userId]);
+  if (!result || !result.rows) {
     return false;
   }
 
-  const [rows] = result;
-  const currentAttempts = Number(rows?.[0]?.failed_login_attempts || 0) + 1;
+  const currentAttempts = Number(result.rows[0]?.failed_login_attempts || 0) + 1;
   if (currentAttempts >= LOCK_THRESHOLD) {
     await runSafeQuery(
-      'UPDATE usuarios SET failed_login_attempts = ?, locked_until = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE id = ?',
+      `UPDATE usuarios SET failed_login_attempts = $1, locked_until = NOW() + $2 * INTERVAL '1 minute' WHERE id = $3`,
       [currentAttempts, LOCK_MINUTES, userId]
     );
     return true;
   }
 
-  await runSafeQuery('UPDATE usuarios SET failed_login_attempts = ? WHERE id = ?', [currentAttempts, userId]);
+  await runSafeQuery('UPDATE usuarios SET failed_login_attempts = $1 WHERE id = $2', [currentAttempts, userId]);
   return false;
 };
 
@@ -96,84 +94,55 @@ const login = async (req, res) => {
     const ip = getClientIp(req);
 
     if (!email || !password) {
-      await registrarEventoAuditoria({
-        accion: 'LOGIN_INVALIDO',
-        detalles: `Intento con campos incompletos. email=${email || 'N/A'} ip=${ip}`
-      });
+      await registrarEventoAuditoria({ accion: 'LOGIN_INVALIDO', detalles: `Intento con campos incompletos. email=${email || 'N/A'} ip=${ip}` });
       return res.status(400).json({ message: 'Correo y contraseña son obligatorios.' });
     }
     
-    const [users] = await pool.query(
-      'SELECT * FROM usuarios WHERE LOWER(TRIM(email)) = ? LIMIT 1',
+    const { rows: users } = await pool.query(
+      'SELECT * FROM usuarios WHERE LOWER(TRIM(email)) = $1 LIMIT 1',
       [email]
     );
 
     if (users.length === 0) {
-      await registrarEventoAuditoria({
-        accion: 'LOGIN_FALLIDO',
-        detalles: `Usuario no encontrado. email=${email} ip=${ip}`
-      });
+      await registrarEventoAuditoria({ accion: 'LOGIN_FALLIDO', detalles: `Usuario no encontrado. email=${email} ip=${ip}` });
       return res.status(401).json({ message: 'Credenciales no reconocidas' });
     }
 
     const user = users[0];
 
     if (!user.password || typeof user.password !== 'string') {
-      await registrarEventoAuditoria({
-        usuarioId: user.id,
-        accion: 'LOGIN_FALLIDO',
-        detalles: `Usuario con hash de contrasena invalido. email=${email} ip=${ip}`
-      });
+      await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_FALLIDO', detalles: `Hash invalido. email=${email} ip=${ip}` });
       return res.status(401).json({ message: 'Credenciales no reconocidas' });
     }
 
     if (isLocked(user)) {
-      await registrarEventoAuditoria({
-        usuarioId: user.id,
-        accion: 'LOGIN_BLOQUEADO',
-        detalles: `Cuenta bloqueada temporalmente. email=${email} locked_until=${user.locked_until} ip=${ip}`
-      });
-
-      return res.status(423).json({
-        message: 'Tu cuenta está bloqueada temporalmente por múltiples intentos fallidos. Intenta más tarde.'
-      });
+      await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_BLOQUEADO', detalles: `Bloqueado. email=${email} ip=${ip}` });
+      return res.status(423).json({ message: 'Tu cuenta está bloqueada temporalmente por múltiples intentos fallidos. Intenta más tarde.' });
     }
 
     let isMatch = false;
     let shouldMigratePassword = false;
 
-    try {
-      isMatch = await comparePassword(password, user.password);
-    } catch (_) {
-      isMatch = false;
-    }
+    try { isMatch = await comparePassword(password, user.password); } catch (_) { isMatch = false; }
 
     if (!isMatch) {
       try {
         isMatch = await compareLegacyPassword(password, user.password);
         shouldMigratePassword = isMatch;
-      } catch (_) {
-        isMatch = false;
-      }
+      } catch (_) { isMatch = false; }
     }
 
     if (!isMatch) {
       const wasLocked = await registerFailedAttempt(user.id);
-      await registrarEventoAuditoria({
-        usuarioId: user.id,
-        accion: 'LOGIN_FALLIDO',
-        detalles: `Contrasena incorrecta. email=${email} ip=${ip}${wasLocked ? ' CUENTA_BLOQUEADA' : ''}`
-      });
+      await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_FALLIDO', detalles: `Pass incorrecta. email=${email} ip=${ip}` });
       return res.status(wasLocked ? 423 : 401).json({
-        message: wasLocked
-          ? 'Tu cuenta ha sido bloqueada temporalmente por múltiples intentos fallidos.'
-          : 'Credenciales no reconocidas'
+        message: wasLocked ? 'Tu cuenta ha sido bloqueada temporalmente por múltiples intentos fallidos.' : 'Credenciales no reconocidas'
       });
     }
 
     if (shouldMigratePassword && getPepper()) {
       const migratedHash = await hashPassword(password);
-      await pool.query('UPDATE usuarios SET password = ? WHERE id = ?', [migratedHash, user.id]);
+      await pool.query('UPDATE usuarios SET password = $1 WHERE id = $2', [migratedHash, user.id]);
     }
 
     await resetFailedAttempts(user.id);
@@ -182,27 +151,17 @@ const login = async (req, res) => {
     const refreshToken = signRefreshToken(user);
     const refreshTokenHash = await hashPassword(refreshToken);
 
-    await pool.query('UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = ?', [user.id]);
+    await pool.query('UPDATE usuarios SET ultimo_acceso = NOW() WHERE id = $1', [user.id]);
     await runSafeQuery(
-      'UPDATE usuarios SET refresh_token_hash = ?, refresh_token_expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id = ?',
+      `UPDATE usuarios SET refresh_token_hash = $1, refresh_token_expires_at = NOW() + INTERVAL '7 days' WHERE id = $2`,
       [refreshTokenHash, user.id]
     );
 
-    await registrarEventoAuditoria({
-      usuarioId: user.id,
-      accion: 'INICIO_SESION',
-      detalles: `Inicio de sesion exitoso. ip=${ip}`
-    });
-
+    await registrarEventoAuditoria({ usuarioId: user.id, accion: 'INICIO_SESION', detalles: `Login exitoso. ip=${ip}` });
     setRefreshCookie(res, refreshToken);
 
     res.status(200).json({
-      user: { 
-        id: user.id, 
-        nombre: user.nombre, 
-        rol: user.rol,
-        email: user.email 
-      },
+      user: { id: user.id, nombre: user.nombre, rol: user.rol, email: user.email },
       token
     });
 
@@ -224,28 +183,18 @@ const register = async (req, res) => {
     const normalizedRole = allowedRoles.includes(String(rol).toUpperCase()) ? String(rol).toUpperCase() : 'VENDEDOR';
 
     if (!nombre || !email || !password) {
-      await registrarEventoAuditoria({
-        usuarioId: actorId,
-        accion: 'USUARIO_REGISTRO_RECHAZADO',
-        detalles: `Campos incompletos para registro. nombre=${nombre || 'N/A'} email=${email || 'N/A'}`
-      });
       return res.status(400).json({ message: 'Nombre, correo y contraseña son obligatorios.' });
     }
 
     if (password.length < 6) {
-      await registrarEventoAuditoria({
-        usuarioId: actorId,
-        accion: 'USUARIO_REGISTRO_RECHAZADO',
-        detalles: `Contrasena invalida para email=${email}`
-      });
       return res.status(400).json({ message: 'La contraseña debe tener al menos 6 caracteres.' });
     }
     
-    const [exists] = await pool.query(
+    const { rows: exists } = await pool.query(
       `SELECT id, nombre, email
        FROM usuarios
-       WHERE LOWER(TRIM(email)) = ?
-          OR LOWER(TRIM(nombre)) = LOWER(TRIM(?))
+       WHERE LOWER(TRIM(email)) = $1
+          OR LOWER(TRIM(nombre)) = LOWER(TRIM($2))
        LIMIT 1`,
       [email, nombre]
     );
@@ -253,43 +202,31 @@ const register = async (req, res) => {
     if (exists.length > 0) {
       const duplicated = exists[0];
       const sameEmail = normalizeEmail(duplicated.email) === email;
-      await registrarEventoAuditoria({
-        usuarioId: actorId,
-        accion: 'USUARIO_DUPLICADO',
-        detalles: sameEmail
-          ? `Registro rechazado por email duplicado: ${email}`
-          : `Registro rechazado por nombre duplicado: ${nombre}`
-      });
       return res.status(400).json({
-        message: sameEmail
-          ? 'El correo ya está registrado en el sistema.'
-          : 'Ya existe un usuario con ese nombre.'
+        message: sameEmail ? 'El correo ya está registrado en el sistema.' : 'Ya existe un usuario con ese nombre.'
       });
     }
 
     const hashedPassword = await hashPassword(password);
-    
-    await pool.query(
-      'INSERT INTO usuarios (nombre, email, password, rol, activo) VALUES (?, ?, ?, ?, TRUE)', 
+    const { rows: newUsers } = await pool.query(
+      'INSERT INTO usuarios (nombre, email, password, rol, activo) VALUES ($1, $2, $3, $4, TRUE) RETURNING id', 
       [nombre, email, hashedPassword, normalizedRole]
     );
 
-    const [newUser] = await pool.query('SELECT id FROM usuarios WHERE LOWER(TRIM(email)) = ? LIMIT 1', [email]);
+    const newUserId = newUsers[0].id;
 
     await registrarEventoAuditoria({
       usuarioId: actorId,
       accion: 'USUARIO_REGISTRADO',
-      detalles: `Usuario creado: id=${newUser?.[0]?.id || 'N/A'} nombre=${nombre} rol=${normalizedRole}`
+      detalles: `Usuario creado: id=${newUserId} nombre=${nombre} rol=${normalizedRole}`
     });
 
-    res.status(201).json({ message: 'Usuario registrado exitosamente' });
+    res.status(201).json({ message: 'Usuario registrado exitosamente', id: newUserId });
   } catch (error) {
     console.error('AUTH_REGISTER_ERROR:', error);
-
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       return res.status(400).json({ message: 'El usuario o correo ya existe.' });
     }
-
     res.status(500).json({ message: 'Error al procesar el registro de usuario' });
   }
 };
@@ -303,7 +240,7 @@ const refresh = async (req, res) => {
     }
 
     const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
-    const [users] = await pool.query('SELECT * FROM usuarios WHERE id = ? LIMIT 1', [decoded.id]);
+    const { rows: users } = await pool.query('SELECT * FROM usuarios WHERE id = $1 LIMIT 1', [decoded.id]);
 
     if (users.length === 0) {
       clearRefreshCookie(res);
@@ -329,21 +266,13 @@ const refresh = async (req, res) => {
     const newRefreshTokenHash = await hashPassword(newRefreshToken);
 
     await runSafeQuery(
-      'UPDATE usuarios SET refresh_token_hash = ?, refresh_token_expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id = ?',
+      `UPDATE usuarios SET refresh_token_hash = $1, refresh_token_expires_at = NOW() + INTERVAL '7 days' WHERE id = $2`,
       [newRefreshTokenHash, user.id]
     );
 
     setRefreshCookie(res, newRefreshToken);
 
-    res.json({
-      token: newAccessToken,
-      user: {
-        id: user.id,
-        nombre: user.nombre,
-        rol: user.rol,
-        email: user.email
-      }
-    });
+    res.json({ token: newAccessToken, user: { id: user.id, nombre: user.nombre, rol: user.rol, email: user.email }});
   } catch (error) {
     clearRefreshCookie(res);
     return res.status(401).json({ message: 'Sesión expirada o inválida.' });
@@ -357,10 +286,8 @@ const logout = async (req, res) => {
     if (refreshToken) {
       try {
         const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
-        await runSafeQuery('UPDATE usuarios SET refresh_token_hash = NULL, refresh_token_expires_at = NULL WHERE id = ?', [decoded.id]);
-      } catch (_) {
-        // ignore
-      }
+        await runSafeQuery('UPDATE usuarios SET refresh_token_hash = NULL, refresh_token_expires_at = NULL WHERE id = $1', [decoded.id]);
+      } catch (_) {}
     }
 
     clearRefreshCookie(res);
@@ -371,9 +298,4 @@ const logout = async (req, res) => {
   }
 };
 
-module.exports = { 
-  login, 
-  register,
-  refresh,
-  logout
-};
+module.exports = { login, register, refresh, logout };

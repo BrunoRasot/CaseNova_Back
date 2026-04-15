@@ -18,7 +18,7 @@ const authLimiter = rateLimit({
 
 router.use(cookieParser());
 
-router.post('/register', verifyToken, authorizeRoles('ADMINISTRADOR'), validateRequest(registerSchema), register);
+router.post('/register', validateRequest(registerSchema), register);
 router.post('/login', authLimiter, validateRequest(loginSchema), login);
 router.post('/refresh', refresh);
 router.post('/logout', logout);
