@@ -94,6 +94,7 @@ const login = async (req, res) => {
     const ip = getClientIp(req);
 
     if (!email || !password) {
+      console.log('AUDITORIA DEBUG: login - campos incompletos, llamando registrarEventoAuditoria');
       await registrarEventoAuditoria({ accion: 'LOGIN_INVALIDO', detalles: `Intento con campos incompletos. email=${email || 'N/A'} ip=${ip}` });
       return res.status(400).json({ message: 'Correo y contraseña son obligatorios.' });
     }
@@ -104,6 +105,7 @@ const login = async (req, res) => {
     );
 
     if (users.length === 0) {
+      console.log('AUDITORIA DEBUG: login - usuario no encontrado, llamando registrarEventoAuditoria');
       await registrarEventoAuditoria({ accion: 'LOGIN_FALLIDO', detalles: `Usuario no encontrado. email=${email} ip=${ip}` });
       return res.status(401).json({ message: 'Credenciales no reconocidas' });
     }
@@ -111,11 +113,13 @@ const login = async (req, res) => {
     const user = users[0];
 
     if (!user.password || typeof user.password !== 'string') {
+      console.log('AUDITORIA DEBUG: login - hash invalido, llamando registrarEventoAuditoria', { userId: user.id });
       await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_FALLIDO', detalles: `Hash invalido. email=${email} ip=${ip}` });
       return res.status(401).json({ message: 'Credenciales no reconocidas' });
     }
 
     if (isLocked(user)) {
+      console.log('AUDITORIA DEBUG: login - cuenta bloqueada, llamando registrarEventoAuditoria', { userId: user.id });
       await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_BLOQUEADO', detalles: `Bloqueado. email=${email} ip=${ip}` });
       return res.status(423).json({ message: 'Tu cuenta está bloqueada temporalmente por múltiples intentos fallidos. Intenta más tarde.' });
     }
@@ -134,6 +138,7 @@ const login = async (req, res) => {
 
     if (!isMatch) {
       const wasLocked = await registerFailedAttempt(user.id);
+      console.log('AUDITORIA DEBUG: login - password incorrecta, llamando registrarEventoAuditoria', { userId: user.id, wasLocked });
       await registrarEventoAuditoria({ usuarioId: user.id, accion: 'LOGIN_FALLIDO', detalles: `Pass incorrecta. email=${email} ip=${ip}` });
       return res.status(wasLocked ? 423 : 401).json({
         message: wasLocked ? 'Tu cuenta ha sido bloqueada temporalmente por múltiples intentos fallidos.' : 'Credenciales no reconocidas'
@@ -157,6 +162,7 @@ const login = async (req, res) => {
       [refreshTokenHash, user.id]
     );
 
+    console.log('AUDITORIA DEBUG: login - exitoso, llamando registrarEventoAuditoria', { userId: user.id });
     await registrarEventoAuditoria({ usuarioId: user.id, accion: 'INICIO_SESION', detalles: `Login exitoso. ip=${ip}` });
     setRefreshCookie(res, refreshToken);
 
