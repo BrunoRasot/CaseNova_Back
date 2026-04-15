@@ -1,0 +1,2 @@
+ALTER TABLE ventas
+ADD COLUMN marca_tarjeta VARCHAR(40) NULL;
